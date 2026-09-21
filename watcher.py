@@ -18,34 +18,36 @@ def run_git(cmd):
 def main():
     print("=" * 65)
     print("STRAIT by Penguin - Git-Native Real-Time Watcher")
-    print(f"Monitoring branch: origin/{BRANCH} (Zero-Cache Mode)")
+    print(f"Monitoring branch: origin/{BRANCH} (Forced Sync Mode)")
     print("=" * 65)
 
-    # Initial sync to ensure local is up to date
+    # Initial sync
     run_git(["fetch", "origin", BRANCH])
-    last_commit = run_git(["rev-parse", "HEAD"])
-    print(f"[*] Initial HEAD commit: {last_commit[:7]}")
+    last_commit = run_git(["rev-parse", f"origin/{BRANCH}"])
+    run_git(["reset", "--hard", f"origin/{BRANCH}"])
+    print(f"[*] Initial commit synced: {last_commit[:7]}")
     print("[*] Waiting for Device A pushes...")
 
     while True:
         try:
-            # 1. Fetch latest metadata directly from GitHub (bypasses all CDN caches)
+            # 1. Fetch latest metadata from GitHub
             run_git(["fetch", "origin", BRANCH])
             remote_commit = run_git(["rev-parse", f"origin/{BRANCH}"])
 
-            # 2. Check if a new commit landed
+            # 2. Check for new commit
             if remote_commit and remote_commit != last_commit:
                 print(
                     f"\n\n[+] New commit detected! {last_commit[:7]} -> {remote_commit[:7]}"
                 )
-                print("[*] Pulling changes from origin...")
+                print("[*] Syncing workspace with remote...")
 
-                pull_res = run_git(["pull", "--rebase", "origin", BRANCH])
-                print(pull_res)
+                # Force working directory to exact remote state
+                sync_out = run_git(["reset", "--hard", f"origin/{BRANCH}"])
+                print(f"[*] Git: {sync_out}")
 
-                # 3. Read the freshly pulled local latest.txt
+                # 3. Read latest.txt
                 if not os.path.exists("latest.txt"):
-                    print("[!] latest.txt not found after pull.")
+                    print("[!] latest.txt still not found on disk.")
                     last_commit = remote_commit
                     continue
 
@@ -55,13 +57,11 @@ def main():
                 print(f"[*] Payload pointer: '{active_csv}'")
 
                 if not os.path.exists(active_csv):
-                    print(
-                        f"[!] Error: {active_csv} was not downloaded by git pull."
-                    )
+                    print(f"[!] Error: {active_csv} was not found on disk.")
                     last_commit = remote_commit
                     continue
 
-                # 4. Trigger antarctic_nav.py with the real file
+                # 4. Trigger navigation
                 print(
                     f"[*] Launching antarctic_nav.py with {active_csv}...\n"
                     + "=" * 50
@@ -72,7 +72,6 @@ def main():
                 print("=" * 50)
                 print(f"[*] Route generation complete for {active_csv}!")
 
-                # Update pointer so we don't repeat this commit
                 last_commit = remote_commit
                 print("[*] Resuming monitor loop...")
             else:
@@ -80,7 +79,7 @@ def main():
 
         except subprocess.CalledProcessError as err:
             print(f"\n[!] antarctic_nav.py exited with error code {err.returncode}")
-            last_commit = remote_commit  # Prevent infinite crash loops
+            last_commit = remote_commit
         except KeyboardInterrupt:
             print("\n[!] Watcher stopped by user.")
             break
