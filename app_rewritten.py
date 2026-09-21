@@ -1,3 +1,4 @@
+import glob
 import os
 import numpy as np
 import plotly.graph_objects as go
@@ -14,16 +15,7 @@ from antarctic_nav import (
 # -----------------------------------------------------------------------------
 # ICE ROUTE GUARDIAN
 # Bridge-style frontend for antarctic_nav.py (75x75 Grid Version).
-#
-# This app is intentionally aligned with the backend's actual data model:
-#   Vessel.max_speed_knots
-#   Route.distance_nm
-#   Route.travel_time_h
-#   Route.risk / fuel / stale_data
-#
-# Research prototype only. Not certified navigation software.
 # -----------------------------------------------------------------------------
-
 
 st.set_page_config(
     page_title="IceRoute Guardian | Polar Bridge",
@@ -243,18 +235,54 @@ st.markdown(
 
 
 # -----------------------------------------------------------------------------
-# DATA
+# WATCHER HELPER
 # -----------------------------------------------------------------------------
 
-@st.cache_data(show_spinner=False)
+def get_watched_csv_path() -> str:
+    """Reads latest.txt managed by watcher.py to get the active CSV payload."""
+    if os.path.exists("latest.txt"):
+        try:
+            with open("latest.txt", "r", encoding="utf-8") as f:
+                target = f.read().strip().replace('"', '').replace("'", "")
+                if target and os.path.exists(target):
+                    return target
+                base = os.path.basename(target)
+                if base and os.path.exists(base):
+                    return base
+                matches = glob.glob(f"**/{base}", recursive=True)
+                if matches:
+                    return matches[0]
+        except Exception:
+            pass
+
+    # Fallback to the newest generated matrix in the folder
+    csv_candidates = [
+        f for f in glob.glob("risk_map_*.csv")
+        if f != "ocean_vectors_antarctic.csv"
+    ]
+    if csv_candidates:
+        csv_candidates.sort(key=os.path.getmtime, reverse=True)
+        return csv_candidates[0]
+
+    return "risk_map_75x75.csv"
+
+
+# -----------------------------------------------------------------------------
+# DATA LOADING WITH CACHE INVALIDATION
+# -----------------------------------------------------------------------------
+
 def load_grid(path: str):
+    mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
+    return _load_grid_cached(path, mtime)
+
+
+@st.cache_data(show_spinner=False)
+def _load_grid_cached(path: str, mtime: float):
     return load_grid_from_csv(path)
 
 
 def fallback_grid(n: int = 75) -> Grid:
-    """
-    Display/testing fallback when the supplied risk matrix is unavailable.
-    """
+    """Display/testing fallback when the supplied risk matrix is unavailable."""
     yy, xx = np.mgrid[-1:1:complex(n), -1:1:complex(n)]
     r = np.sqrt(xx * xx + yy * yy)
 
@@ -267,11 +295,9 @@ def fallback_grid(n: int = 75) -> Grid:
     texture = np.clip(texture, 0, 1)
 
     cells = {}
-
     for row in range(n):
         for col in range(n):
             value = float(texture[row, col] * 9)
-
             cells[(row, col)] = Cell(
                 row=row,
                 col=col,
@@ -288,10 +314,8 @@ def fallback_grid(n: int = 75) -> Grid:
 
 def matrix_from_grid(grid: Grid) -> np.ndarray:
     z = np.zeros((grid.rows, grid.cols), dtype=float)
-
     for (row, col), cell in grid.cells.items():
         z[row, col] = cell.ice_concentration * 9.0
-
     return z
 
 
@@ -314,20 +338,13 @@ def downsample(array: np.ndarray, target: int = 75) -> np.ndarray:
     ).mean(axis=(1, 3))
 
 
-def route_xy(
-    route_cells,
-    rows: int,
-    cols: int,
-    target_rows: int,
-    target_cols: int,
-):
+def route_xy(route_cells, rows: int, cols: int, target_rows: int, target_cols: int):
     """Map backend grid coordinates onto the downsampled Plotly coordinates."""
     sy = (target_rows - 1) / max(rows - 1, 1)
     sx = (target_cols - 1) / max(cols - 1, 1)
 
     xs = [col * sx for row, col in route_cells]
     ys = [row * sy for row, col in route_cells]
-
     return xs, ys
 
 
@@ -338,9 +355,16 @@ def route_xy(
 st.sidebar.markdown("### ICE ROUTE GUARDIAN")
 st.sidebar.caption("POLAR BRIDGE / ROUTE PLANNING (75x75)")
 
+active_latest_csv = get_watched_csv_path()
+
+# Keep session state updated with latest.txt changes
+if "last_watched_csv" not in st.session_state or st.session_state.last_watched_csv != active_latest_csv:
+    st.session_state.last_watched_csv = active_latest_csv
+    st.session_state.csv_input_field = active_latest_csv
+
 csv_path = st.sidebar.text_input(
-    "RISK MATRIX",
-    value="risk_map_75x75.csv",
+    "RISK MATRIX (via latest.txt)",
+    key="csv_input_field",
     help="CSV consumed by load_grid_from_csv() in antarctic_nav.py.",
 )
 
@@ -455,13 +479,13 @@ if st.sidebar.button("RECALCULATE ROUTE", use_container_width=True):
 
 
 # -----------------------------------------------------------------------------
-# LOAD GRID
+# LOAD GRID EXECUTION
 # -----------------------------------------------------------------------------
 
 if os.path.exists(csv_path):
     try:
         grid = load_grid(csv_path)
-        data_status = "RISK MATRIX ONLINE"
+        data_status = f"RISK MATRIX ONLINE ({csv_path})"
         data_error = None
     except Exception as exc:
         grid = fallback_grid()
@@ -469,12 +493,12 @@ if os.path.exists(csv_path):
         data_error = str(exc)
 else:
     grid = fallback_grid()
-    data_status = "DISPLAY FALLBACK · CSV NOT FOUND"
+    data_status = f"DISPLAY FALLBACK · CSV NOT FOUND ({csv_path})"
     data_error = None
 
 
 # -----------------------------------------------------------------------------
-# CLAMP INPUT COORDINATES TO THE ACTUAL GRID
+# CLAMP INPUT COORDINATES
 # -----------------------------------------------------------------------------
 
 start = (
@@ -521,7 +545,6 @@ try:
 except Exception as exc:
     route_error = str(exc)
 
-
 z_full = matrix_from_grid(grid)
 z = downsample(z_full, 75)
 
@@ -562,7 +585,6 @@ if data_error:
 
 if route:
     top = st.columns(6)
-
     values = [
         ("SPEED LIMIT", f"{vessel.max_speed_knots:.1f}", "KN"),
         ("ROUTE", f"{route.distance_nm:.2f}", "NM"),
@@ -595,7 +617,6 @@ else:
 
 left, right = st.columns([4.7, 1.35], gap="small")
 
-
 with left:
     st.markdown(
         '<div class="section-label">PRIMARY POLAR CHART / ROUTE DISPLAY (75x75)</div>',
@@ -604,7 +625,7 @@ with left:
 
     fig = go.Figure()
 
-    # SAR-like grayscale ice field.
+    # SAR-like grayscale ice field
     fig.add_trace(
         go.Heatmap(
             z=z,
@@ -626,7 +647,7 @@ with left:
         )
     )
 
-    # Risk overlay.
+    # Risk overlay
     if show_risk:
         fig.add_trace(
             go.Heatmap(
@@ -645,7 +666,7 @@ with left:
             )
         )
 
-    # Range rings (optional for smaller grid).
+    # Range rings
     if show_range:
         cx = (z.shape[1] - 1) / 2
         cy = (z.shape[0] - 1) / 2
@@ -658,7 +679,6 @@ with left:
         ]:
             radius = maxrad * frac
             theta = np.linspace(0, 2 * np.pi, 180)
-
             fig.add_trace(
                 go.Scatter(
                     x=cx + radius * np.cos(theta),
@@ -674,7 +694,7 @@ with left:
                 )
             )
 
-    # Navigation grid.
+    # Navigation grid
     if show_grid:
         for x in np.linspace(0, z.shape[1] - 1, 15):
             fig.add_vline(
@@ -682,7 +702,6 @@ with left:
                 line_width=1,
                 line_color="rgba(100,150,160,.12)",
             )
-
         for y in np.linspace(0, z.shape[0] - 1, 15):
             fig.add_hline(
                 y=y,
@@ -690,7 +709,7 @@ with left:
                 line_color="rgba(100,150,160,.12)",
             )
 
-    # A* route.
+    # A* route path
     if route and show_route:
         xs, ys = route_xy(
             route.cells,
@@ -699,7 +718,6 @@ with left:
             z.shape[0],
             z.shape[1],
         )
-
         fig.add_trace(
             go.Scatter(
                 x=xs,
@@ -721,7 +739,7 @@ with left:
     gx = goal[1] * (z.shape[1] - 1) / max(grid.cols - 1, 1)
     gy = goal[0] * (z.shape[0] - 1) / max(grid.rows - 1, 1)
 
-    # Own vessel.
+    # Own vessel marker
     fig.add_trace(
         go.Scatter(
             x=[sx],
@@ -744,7 +762,7 @@ with left:
         )
     )
 
-    # Destination.
+    # Destination marker
     fig.add_trace(
         go.Scatter(
             x=[gx],
@@ -947,13 +965,11 @@ with right:
 st.markdown("---")
 a, b, c = st.columns([1.1, 1.1, 2.2])
 
-
 with a:
     st.markdown(
         '<div class="section-label">ICE LEGEND</div>',
         unsafe_allow_html=True,
     )
-
     st.markdown(
         """
         <div class="data-box small-mono">
@@ -966,13 +982,11 @@ with a:
         unsafe_allow_html=True,
     )
 
-
 with b:
     st.markdown(
         '<div class="section-label">SYSTEM STATE</div>',
         unsafe_allow_html=True,
     )
-
     st.markdown(
         f"""
         <div class="data-box small-mono">
@@ -986,13 +1000,11 @@ with b:
         unsafe_allow_html=True,
     )
 
-
 with c:
     st.markdown(
         '<div class="section-label">NAVIGATION NOTICE</div>',
         unsafe_allow_html=True,
     )
-
     st.markdown(
         """
         <div class="data-box small-mono">
