@@ -13,7 +13,7 @@ from antarctic_nav import (
 
 # -----------------------------------------------------------------------------
 # ICE ROUTE GUARDIAN
-# Bridge-style frontend for antarctic_nav.py.
+# Bridge-style frontend for antarctic_nav.py (75x75 Grid Version).
 #
 # This app is intentionally aligned with the backend's actual data model:
 #   Vessel.max_speed_knots
@@ -251,12 +251,9 @@ def load_grid(path: str):
     return load_grid_from_csv(path)
 
 
-def fallback_grid(n: int = 250) -> Grid:
+def fallback_grid(n: int = 75) -> Grid:
     """
     Display/testing fallback when the supplied risk matrix is unavailable.
-
-    The backend's real CSV loader uses 10 m cells, so the fallback uses the
-    same cell scale rather than the old 1 km placeholder scale.
     """
     yy, xx = np.mgrid[-1:1:complex(n), -1:1:complex(n)]
     r = np.sqrt(xx * xx + yy * yy)
@@ -298,7 +295,7 @@ def matrix_from_grid(grid: Grid) -> np.ndarray:
     return z
 
 
-def downsample(array: np.ndarray, target: int = 300) -> np.ndarray:
+def downsample(array: np.ndarray, target: int = 75) -> np.ndarray:
     """Reduce the rendered heatmap size without changing the routing grid."""
     if max(array.shape) <= target:
         return array
@@ -339,11 +336,11 @@ def route_xy(
 # -----------------------------------------------------------------------------
 
 st.sidebar.markdown("### ICE ROUTE GUARDIAN")
-st.sidebar.caption("POLAR BRIDGE / ROUTE PLANNING")
+st.sidebar.caption("POLAR BRIDGE / ROUTE PLANNING (75x75)")
 
 csv_path = st.sidebar.text_input(
     "RISK MATRIX",
-    value="risk_map_1000x1000.csv",
+    value="risk_map_75x75.csv",
     help="CSV consumed by load_grid_from_csv() in antarctic_nav.py.",
 )
 
@@ -356,7 +353,6 @@ profile = st.sidebar.selectbox(
 st.sidebar.markdown("---")
 st.sidebar.markdown("**VESSEL LIMITS**")
 
-# IMPORTANT: antarctic_nav.Vessel uses knots, not km/h.
 max_speed_knots = st.sidebar.number_input(
     "MAX SPEED · knots",
     min_value=1.0,
@@ -398,46 +394,46 @@ wind_limit = st.sidebar.number_input(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("**ROUTE CONTROL**")
+st.sidebar.markdown("**ROUTE CONTROL** (75x75 Grid)")
 
 start_r = st.sidebar.number_input(
     "ORIGIN ROW",
     min_value=0,
-    max_value=9999,
-    value=50,
+    max_value=74,
+    value=5,
     step=1,
 )
 
 start_c = st.sidebar.number_input(
     "ORIGIN COL",
     min_value=0,
-    max_value=9999,
-    value=50,
+    max_value=74,
+    value=5,
     step=1,
 )
 
 goal_r = st.sidebar.number_input(
     "DESTINATION ROW",
     min_value=0,
-    max_value=9999,
-    value=900,
+    max_value=74,
+    value=70,
     step=1,
 )
 
 goal_c = st.sidebar.number_input(
     "DESTINATION COL",
     min_value=0,
-    max_value=9999,
-    value=900,
+    max_value=74,
+    value=70,
     step=1,
 )
 
 buffer_cells = st.sidebar.slider(
     "CORRIDOR BUFFER · cells",
-    min_value=25,
-    max_value=400,
-    value=300,
-    step=25,
+    min_value=5,
+    max_value=74,
+    value=50,
+    step=5,
 )
 
 diagonals = st.sidebar.checkbox(
@@ -449,8 +445,8 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("**LAYERS**")
 
 show_risk = st.sidebar.checkbox("ICE RISK", True)
-show_grid = st.sidebar.checkbox("NAVIGATION GRID", False)
-show_range = st.sidebar.checkbox("RANGE RINGS", True)
+show_grid = st.sidebar.checkbox("NAVIGATION GRID", True)
+show_range = st.sidebar.checkbox("RANGE RINGS", False)
 show_route = st.sidebar.checkbox("OPTIMAL ROUTE", True)
 
 if st.sidebar.button("RECALCULATE ROUTE", use_container_width=True):
@@ -527,7 +523,7 @@ except Exception as exc:
 
 
 z_full = matrix_from_grid(grid)
-z = downsample(z_full, 300)
+z = downsample(z_full, 75)
 
 
 # -----------------------------------------------------------------------------
@@ -542,7 +538,7 @@ st.markdown(
             <div>
                 <div class="brand-title">ICE ROUTE GUARDIAN</div>
                 <div class="brand-sub">
-                    ANTARCTIC ICE NAVIGATION / ROUTE PLANNING CONSOLE
+                    ANTARCTIC ICE NAVIGATION / ROUTE PLANNING CONSOLE (75x75)
                 </div>
             </div>
         </div>
@@ -602,7 +598,7 @@ left, right = st.columns([4.7, 1.35], gap="small")
 
 with left:
     st.markdown(
-        '<div class="section-label">PRIMARY POLAR CHART / ROUTE DISPLAY</div>',
+        '<div class="section-label">PRIMARY POLAR CHART / ROUTE DISPLAY (75x75)</div>',
         unsafe_allow_html=True,
     )
 
@@ -649,17 +645,16 @@ with left:
             )
         )
 
-    # Polar-style range rings.
+    # Range rings (optional for smaller grid).
     if show_range:
         cx = (z.shape[1] - 1) / 2
         cy = (z.shape[0] - 1) / 2
         maxrad = min(z.shape) * 0.45
 
         for frac, label in [
-            (0.25, "25 NM"),
-            (0.50, "50 NM"),
-            (0.75, "75 NM"),
-            (1.00, "100 NM"),
+            (0.33, "10 NM"),
+            (0.66, "20 NM"),
+            (1.00, "30 NM"),
         ]:
             radius = maxrad * frac
             theta = np.linspace(0, 2 * np.pi, 180)
@@ -679,30 +674,20 @@ with left:
                 )
             )
 
-            fig.add_annotation(
-                x=cx + radius,
-                y=cy,
-                text=label,
-                showarrow=False,
-                font=dict(size=8, color="#759099"),
-                xanchor="left",
-                yanchor="bottom",
-            )
-
     # Navigation grid.
     if show_grid:
-        for x in np.linspace(0, z.shape[1] - 1, 9):
+        for x in np.linspace(0, z.shape[1] - 1, 15):
             fig.add_vline(
                 x=x,
                 line_width=1,
-                line_color="rgba(100,150,160,.10)",
+                line_color="rgba(100,150,160,.12)",
             )
 
-        for y in np.linspace(0, z.shape[0] - 1, 9):
+        for y in np.linspace(0, z.shape[0] - 1, 15):
             fig.add_hline(
                 y=y,
                 line_width=1,
-                line_color="rgba(100,150,160,.10)",
+                line_color="rgba(100,150,160,.12)",
             )
 
     # A* route.
@@ -730,7 +715,6 @@ with left:
             )
         )
 
-    # Convert real grid coordinates to displayed/downsampled coordinates.
     sx = start[1] * (z.shape[1] - 1) / max(grid.cols - 1, 1)
     sy = start[0] * (z.shape[0] - 1) / max(grid.rows - 1, 1)
 
@@ -791,14 +775,14 @@ with left:
         font=dict(family="IBM Plex Mono, monospace", color="#a9c0c7"),
         showlegend=False,
         xaxis=dict(
-            title="POLAR GRID / EASTING",
+            title="POLAR GRID / EASTING (75 cells)",
             showgrid=False,
             zeroline=False,
             showticklabels=False,
             fixedrange=False,
         ),
         yaxis=dict(
-            title="POLAR GRID / NORTHING",
+            title="POLAR GRID / NORTHING (75 cells)",
             showgrid=False,
             zeroline=False,
             showticklabels=False,
@@ -824,7 +808,7 @@ with left:
 
     st.markdown(
         '<div class="small-mono">'
-        'POLAR PROJECTION VIEW · SAR-STYLE ICE FIELD · '
+        '75x75 POLAR PROJECTION VIEW · SAR-STYLE ICE FIELD · '
         'A* ROUTE CORRIDOR · GRID DATA IS NOT AN ENC'
         '</div>',
         unsafe_allow_html=True,
@@ -873,8 +857,6 @@ with right:
             unsafe_allow_html=True,
         )
 
-    # Hazard calculation mirrors the backend's risk formula, evaluated at the
-    # destination cell for the UI summary.
     end_cell = grid.cells[goal]
 
     hazard = (

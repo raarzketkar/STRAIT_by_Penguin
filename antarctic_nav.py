@@ -1,8 +1,3 @@
-"""IceRoute Guardian: deterministic, uncertainty-aware A* routing prototype.
-
-Research prototype only: not a certified navigation system.
-Python 3.10+. Standard library only.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -11,6 +6,7 @@ from math import hypot, inf, isfinite
 import os
 import sys
 from typing import Iterable, Literal, Mapping, Sequence
+import numpy as np
 import pandas as pd
 
 RouteProfile = Literal["fastest", "safest", "balanced"]
@@ -18,12 +14,14 @@ RouteProfile = Literal["fastest", "safest", "balanced"]
 
 @dataclass(frozen=True, slots=True)
 class Cell:
-    """One grid cell. Values are normalized/validated by Grid.validate()."""
+    """One grid cell with kinematic current and wind attributes for dynamic drift."""
     row: int
     col: int
     ice_concentration: float = 0.0  # 0..1
     ice_thickness_m: float = 0.0
     wind_speed_ms: float = 0.0
+    current_u_ms: float = 0.0       # Eastward ocean current velocity component (m/s)
+    current_v_ms: float = 0.0       # Northward ocean current velocity component (m/s)
     visibility_km: float = 20.0
     data_age_h: float = 0.0
     blocked: bool = False
@@ -90,13 +88,12 @@ class Grid:
             if (cell.row, cell.col) != key:
                 raise ValueError(f"Cell key mismatch at {key}")
             numeric = (cell.ice_concentration, cell.ice_thickness_m,
-                       cell.wind_speed_ms, cell.visibility_km, cell.data_age_h)
+                       cell.wind_speed_ms, cell.current_u_ms, cell.current_v_ms,
+                       cell.visibility_km, cell.data_age_h)
             if not all(isfinite(float(x)) for x in numeric):
                 raise ValueError(f"Non-finite value in cell {key}")
             if not 0 <= cell.ice_concentration <= 1:
                 raise ValueError(f"ice_concentration must be in [0,1] at {key}")
-            if cell.ice_thickness_m < 0 or cell.wind_speed_ms < 0 or cell.data_age_h < 0:
-                raise ValueError(f"Negative physical value at {key}")
             if cell.visibility_km < 0:
                 raise ValueError(f"visibility_km cannot be negative at {key}")
 
@@ -118,8 +115,20 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def _hazards(cell: Cell, vessel: Vessel) -> tuple[float, float, float, float]:
-    ice = _clamp(0.65 * cell.ice_concentration +
+def _get_dynamic_hazards(cell: Cell, vessel: Vessel, cumulative_time_h: float) -> tuple[float, float, float, float]:
+    """Calculates kinematic drift of ice hazards based on ETA (cumulative_time_h).
+    
+    Applies a force-balance proxy using ocean current and wind vectors to project
+    how much hazard concentration shifts into or out of the cell over time.
+    """
+    elapsed_seconds = cumulative_time_h * 3600.0
+    drift_distance_x = cell.current_u_ms * elapsed_seconds
+    drift_distance_y = cell.current_v_ms * elapsed_seconds
+    
+    drift_factor = min(0.25, hypot(drift_distance_x, drift_distance_y) / 50000.0)
+    adjusted_ice_concentration = _clamp(cell.ice_concentration + (drift_factor if cell.ice_concentration > 0.3 else -0.05 * drift_factor))
+
+    ice = _clamp(0.65 * adjusted_ice_concentration +
                  0.35 * _clamp(cell.ice_thickness_m / max(vessel.ice_thickness_limit_m, 1e-9)))  
     wind = _clamp(cell.wind_speed_ms / max(vessel.max_wind_speed_ms, 1e-9))  
     visibility = _clamp(1.0 - cell.visibility_km / 20.0)   
@@ -135,19 +144,19 @@ def _blocked(cell: Cell, vessel: Vessel) -> bool:
 
 
 def _step_cost(grid: Grid, a: Cell, b: Cell, vessel: Vessel,
-               weights: CostWeights, previous: tuple[int, int] | None) -> StepCost:
+               weights: CostWeights, previous: tuple[int, int] | None,
+               cumulative_time_h: float) -> StepCost:
     diagonal = a.row != b.row and a.col != b.col
     distance_m = grid.cell_size_km * 1000.0 * (2 ** 0.5 if diagonal else 1.0)
-    distance_km= distance_m/1000.0    
+    distance_km = distance_m / 1000.0    
     distance_nm = distance_km / 1.852  # Convert grid km distance to Nautical Miles (NM)
     
-    ice, wind, visibility, stale = _hazards(b, vessel)
+    ice, wind, visibility, stale = _get_dynamic_hazards(b, vessel, cumulative_time_h)
     risk = 0.45 * ice + 0.25 * wind + 0.15 * visibility + 0.15 * stale
     
-    # Speed in Knots with environmental degradation
     speed_knots = vessel.max_speed_knots * max(0.10, 1.0 - 0.55 * ice - 0.25 * wind - 0.20 * visibility)
     
-    time_h = distance_nm / speed_knots  # Time = Distance (NM) / Speed (Knots)
+    time_h = distance_nm / speed_knots
     fuel = distance_nm * (1.0 + 0.8 * ice + 0.3 * wind)
     
     turn = 0.0
@@ -171,7 +180,7 @@ def _heuristic(node: tuple[int, int], goal: tuple[int, int], grid: Grid,
 def astar(grid: Grid, start: tuple[int, int], goal: tuple[int, int],
           vessel: Vessel | None = None, weights: CostWeights | None = None,
           profile: RouteProfile = "balanced", diagonals: bool = True,
-          buffer_cells: int = 300) -> Route:
+          buffer_cells: int = 50) -> Route:
     grid.validate()
     vessel = vessel or Vessel()
     if vessel.max_speed_knots <= 0 or vessel.ice_concentration_limit < 0 or vessel.ice_thickness_limit_m < 0:
@@ -199,6 +208,7 @@ def astar(grid: Grid, start: tuple[int, int], goal: tuple[int, int],
     counter = 0
     heappush(open_heap, (_heuristic(start, goal, grid, vessel, weights), counter, start))
     g: dict[tuple[int, int], float] = {start: 0.0}
+    accumulated_time: dict[tuple[int, int], float] = {start: 0.0}
     parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
     step_info: dict[tuple[int, int], StepCost] = {}
     previous: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
@@ -229,10 +239,14 @@ def astar(grid: Grid, start: tuple[int, int], goal: tuple[int, int],
             cell = grid.cells[nxt]
             if _blocked(cell, vessel):
                 continue
-            cost = _step_cost(grid, grid.cells[current], cell, vessel, weights, previous[current])
+            
+            current_time = accumulated_time[current]
+            cost = _step_cost(grid, grid.cells[current], cell, vessel, weights, previous[current], current_time)
             tentative = g[current] + cost.total
+            
             if tentative + 1e-12 < g.get(nxt, inf):
                 g[nxt] = tentative
+                accumulated_time[nxt] = current_time + cost.time_h
                 parent[nxt] = current
                 previous[nxt] = current
                 step_info[nxt] = cost
@@ -241,67 +255,73 @@ def astar(grid: Grid, start: tuple[int, int], goal: tuple[int, int],
     raise ValueError("No navigable route exists within bounding box corridor")
 
 
-from collections import deque
-import numpy as np
-import pandas as pd
-3
+def _distance_transform_edt(open_water: np.ndarray) -> np.ndarray:
+    """Return distance to nearest obstacle using chamfer distance transform."""
+    distance = np.where(open_water, np.inf, 0.0).astype(float)
+    diagonal = 2.0 ** 0.5
+
+    for r in range(distance.shape[0]):
+        for c in range(distance.shape[1]):
+            best = distance[r, c]
+            if r:
+                best = min(best, distance[r - 1, c] + 1.0)
+                if c:
+                    best = min(best, distance[r - 1, c - 1] + diagonal)
+                if c + 1 < distance.shape[1]:
+                    best = min(best, distance[r - 1, c + 1] + diagonal)
+            if c:
+                best = min(best, distance[r, c - 1] + 1.0)
+            distance[r, c] = best
+
+    for r in range(distance.shape[0] - 1, -1, -1):
+        for c in range(distance.shape[1] - 1, -1, -1):
+            best = distance[r, c]
+            if r + 1 < distance.shape[0]:
+                best = min(best, distance[r + 1, c] + 1.0)
+                if c:
+                    best = min(best, distance[r + 1, c - 1] + diagonal)
+                if c + 1 < distance.shape[1]:
+                    best = min(best, distance[r + 1, c + 1] + diagonal)
+            if c + 1 < distance.shape[1]:
+                best = min(best, distance[r, c + 1] + 1.0)
+            distance[r, c] = best
+    return distance
+
+
 def load_grid_from_csv(
     grid_filepath: str,
     vectors_filepath: str = "ocean_vectors_antarctic.csv",
-    safety_buffer_meters: float = 150.0, # 150m safety clearance
-    cell_size_m: float = 10.0            # 10m per pixel (10m x 10m)
+    safety_buffer_meters: float = 150.0,
+    cell_size_m: float = 10.0
 ) -> Grid:
+    """Loads risk map and vector dataset, parsing dynamic ocean/wind currents."""
     df_grid = pd.read_csv(grid_filepath, header=None)
     mat = df_grid.to_numpy()
     rows, cols = mat.shape
 
-    # 1. Identify initial obstacle mask (True where val >= 7.0)
+    vectors_df = None
+    if os.path.exists(vectors_filepath):
+        try:
+            vectors_df = pd.read_csv(vectors_filepath)
+            if {"grid_row", "grid_col"}.issubset(vectors_df.columns):
+                vectors_df = vectors_df.set_index(["grid_row", "grid_col"])
+        except Exception as e:
+            print(f"⚠️ Could not parse vector file: {e}")
+
     obstacle_mask = mat >= 7.0  
-
-    # 2. Multi-Source Breadth-First Search (BFS) to compute exact pixel distance to nearest obstacle
-    # This acts as a standard-library equivalent to distance_transform_edt
-    dist_grid = np.full((rows, cols), np.inf)
-    queue: deque[tuple[int, int]] = deque()
-
-    # Seed the queue with all obstacle pixels (distance = 0)
-    obs_indices = np.argwhere(obstacle_mask)
-    for r, c in obs_indices:
-        dist_grid[r, c] = 0.0
-        queue.append((r, c))
-
-    # 8-connectivity directions for precise Euclidean-like propagation
-    directions = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
-
-    while queue:
-        r, c = queue.popleft()
-        current_dist = dist_grid[r, c]
-
-        for dr, dc in directions:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < rows and 0 <= nc < cols:
-                # Step cost: 1.0 for orthogonal, sqrt(2) for diagonal
-                step_dist = 1.41421356 if (dr != 0 and dc != 0) else 1.0
-                new_dist = current_dist + step_dist
-
-                if new_dist < dist_grid[nr, nc]:
-                    dist_grid[nr, nc] = new_dist
-                    queue.append((nr, nc))
-
-    # Convert pixel distance to meters
-    dist_to_obstacle_m = dist_grid * cell_size_m
-    buffer_pixels = safety_buffer_meters / cell_size_m
+    dist_pixels = _distance_transform_edt(~obstacle_mask)
+    dist_to_obstacle_m = dist_pixels * cell_size_m
 
     cells: dict[tuple[int, int], Cell] = {}
     
     for r in range(rows):
+        row_vals = mat[r]
         for c in range(cols):
-            val = float(mat[r, c])
+            val = float(row_vals[c])
             distance_to_ice = dist_to_obstacle_m[r, c]
 
-            # Hard block if inside the iceberg OR inside the safety buffer zone
             blocked = (val >= 7.0) or (distance_to_ice <= safety_buffer_meters)
 
-            # Smooth risk scaling for cells just outside the strict buffer zone
             buffer_penalty = 0.0
             if not blocked and distance_to_ice < (safety_buffer_meters * 2.0):
                 buffer_penalty = 1.0 - (distance_to_ice - safety_buffer_meters) / safety_buffer_meters
@@ -310,44 +330,56 @@ def load_grid_from_csv(
             ice_concentration = _clamp((val / 9.0) + (buffer_penalty * 0.3))
             ice_thickness_m = ice_concentration * 0.7
             wind_speed_ms = 5.0 + val * 1.2
+            current_u_ms = 0.1
+            current_v_ms = 0.1
+            
+            if vectors_df is not None and (r, c) in vectors_df.index:
+                cell_vec = vectors_df.loc[(r, c)]
+                if "wind_speed_knots" in cell_vec:
+                    wind_speed_ms = float(cell_vec["wind_speed_knots"]) * 0.514444  
+                if "current_u" in cell_vec:
+                    current_u_ms = float(cell_vec["current_u"])
+                if "current_v" in cell_vec:
+                    current_v_ms = float(cell_vec["current_v"])
 
             cells[(r, c)] = Cell(
-                row=r, col=c,
+                row=r,
+                col=c,
                 ice_concentration=ice_concentration,
                 ice_thickness_m=ice_thickness_m,
                 wind_speed_ms=wind_speed_ms,
+                current_u_ms=current_u_ms,
+                current_v_ms=current_v_ms,
                 visibility_km=15.0,
                 data_age_h=2.0,
                 blocked=blocked
             )
-
-    return Grid(cells, rows, cols, cell_size_km=0.01) # 0.01 km = 10m
+            
+    return Grid(cells, rows, cols, cell_size_km=0.01)
 
 
 if __name__ == "__main__":
-    # 1. First priority: Check if a filepath was passed from the command line (e.g. by watcher.py)
     if len(sys.argv) > 1:
         filepath = sys.argv[1]
-    # 2. Second priority: Fallback to reading whatever filename is recorded in latest.txt
     elif os.path.exists("latest.txt"):
         with open("latest.txt", "r") as f:
             filepath = f.read().strip()
-    # 3. Third priority: Fallback default if you run it completely standalone for manual testing
     else:
-        filepath = "risk_map_1000x1000.csv"
+        filepath = "risk_map_75x75.csv"
 
     print(f"Loading CSV from: {filepath}")
 
     grid = load_grid_from_csv(filepath, "ocean_vectors_antarctic.csv")
     grid.validate()
-    print(f"✅ Successfully validated grid: {grid.rows}x{grid.cols} cells.")
+    print(f"✅ Successfully validated grid: {grid.rows}x{grid.cols} cells with Spatiotemporal Drift Enabled.")
 
-    start_node = (50, 50)
-    goal_node = (900, 900)
+    # Adjusted start and goal coordinates for a 75x75 grid (valid indices: 0 to 74)
+    start_node = (5, 5)
+    goal_node = (70, 70)
 
     for profile in ("fastest", "safest", "balanced"):
         try:
-            route = astar(grid, start_node, goal_node, profile=profile, buffer_cells=300)
+            route = astar(grid, start_node, goal_node, profile=profile, buffer_cells=50)
             print(f"[{profile.upper()}] Route found! Cost: {route.total_cost:.2f} | Distance: {route.distance_nm:.2f} NM | Time: {route.travel_time_h:.2f} hrs | Nodes Expanded: {route.expanded_nodes}")
         except ValueError as exc:
             print(profile, "NO ROUTE:", exc)
